@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from pathlib import Path
 
 from PIL import Image
-
+from torch.utils.data import Dataset
 # OSError: image file is truncated (45 bytes not processed)
 from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -44,7 +44,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser('AttMask', add_help=False)
 
     # Model parameters
-    parser.add_argument('--arch', default='vit_small', type=str,
+    parser.add_argument('--arch', default='vit_base', type=str,
         choices=['vit_tiny', 'vit_small', 'vit_base', 'vit_large'],
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""")
@@ -53,7 +53,7 @@ def get_args_parser():
         values leads to better performance but requires more memory. Applies only
         for ViTs (vit_tiny, vit_small and vit_base). If <16, we recommend disabling
         mixed precision training (--use_fp16 false) to avoid unstabilities.""")
-    parser.add_argument('--out_dim', default=65536, type=int, help="""Dimensionality of
+    parser.add_argument('--out_dim', default=8192, type=int, help="""Dimensionality of
         output for [CLS] token.""")
     parser.add_argument('--patch_out_dim', default=8192, type=int, help="""Dimensionality of
         output for patch tokens.""")
@@ -77,7 +77,7 @@ def get_args_parser():
         help="Whether to use masked image modeling (mim) in backbone (Default: True)")
     parser.add_argument('--pred_ratio', default=0.3, type=float, nargs='+', help="""Ratio of partial prediction.
         If a list of ratio is specified, one of them will be randomly choosed for each patch.""")
-    parser.add_argument('--pred_ratio_var', default=0, type=float, nargs='+', help="""Variance of partial prediction
+    parser.add_argument('--pred_ratio_var', default=0.2, type=float, nargs='+', help="""Variance of partial prediction
         ratio. Length should be indentical to the length of pred_ratio. 0 for disabling. """)
     parser.add_argument('--pred_shape', default='attmask_high', type=str, help="""Shape of partial prediction. 
                         Select between attmask_high, attmask_hint, attmask_low, rand or block""")
@@ -115,13 +115,13 @@ def get_args_parser():
     parser.add_argument('--clip_grad', type=float, default=3.0, help="""Maximal parameter
         gradient norm if using gradient clipping. Clipping with norm .3 ~ 1.0 can
         help optimization for larger ViT architectures. 0 for disabling.""")
-    parser.add_argument('--batch_size_per_gpu', default=128, type=int,
+    parser.add_argument('--batch_size_per_gpu', default=32, type=int,
         help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
         during which we keep the output layer fixed. Typically doing so during
         the first epoch helps training. Try increasing this value if the loss does not decrease.""")
-    parser.add_argument("--lr", default=0.0005, type=float, help="""Learning rate at the end of
+    parser.add_argument("--lr", default=1e-3, type=float, help="""Learning rate at the end of
         linear warmup (highest LR used during training). The learning rate is linearly scaled
         with the batch size, and specified here for a reference batch size of 256.""")
     parser.add_argument("--warmup_epochs", default=10, type=int,
@@ -164,9 +164,9 @@ def get_args_parser():
     
     # Misc
     parser.add_argument('--backend', default='nccl', type=str, help='Specify backend nccl or gloo')
-    parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
+    parser.add_argument('--data_path', default='../data/reflacx-1.0.0/', type=str,
         help='Please specify path to the ImageNet training data.')
-    parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
+    parser.add_argument('--output_dir', default="./output_dir/", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=40, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
@@ -175,7 +175,7 @@ def get_args_parser():
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     parser.add_argument("--subset", default=-1, type=int, help="The number of images per class that they would be use for "
                         "training (default -1). If -1, then all the availabe images are used.")
-    parser.add_argument("--eval_every", default=10, type=int, help="How frequently to run evaluation (epochs)")
+    parser.add_argument("--eval_every", default=1, type=int, help="How frequently to run evaluation (epochs)")
     parser.add_argument("--nb_knn", default=[10, 20, 100, 200], nargs='+', type=int,
                         help="Number of NN to use. 20 is usually working the best.")
     return parser
@@ -196,15 +196,15 @@ def train_attmask(args):
     )
     pred_size = args.patch_size
     dataset_train = ImageFolderMask(
-        os.path.join(args.data_path, "train"), # here we use the path of the train split of imagenet
-        transform=transform_train,
+        args.data_path, # here we use the path of the train split of imagenet
+        transforms=transform_train,
         patch_size=pred_size,
         pred_ratio=args.pred_ratio,
         pred_ratio_var=args.pred_ratio_var,
         pred_aspect_ratio=(0.3, 1/0.3),
         pred_shape=args.pred_shape,
         pred_start_epoch=args.pred_start_epoch)
-
+    # dataset_train=ImageFolderMask(args.data_path,transforms=transform_train)
     if (args.subset is not None) and (args.subset >= 1):
         dataset_train = utils.subset_of_Imagenet_train_split(dataset_train, args.subset)
 
@@ -219,45 +219,45 @@ def train_attmask(args):
         drop_last=True
     )
 
-    # For Online k-NN evaluation
-    transform_knn = transforms.Compose([
-        transforms.Resize(256, interpolation=3),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-    ])
+    # # For Online k-NN evaluation
+    # transform_knn = transforms.Compose([
+    #     transforms.Resize(256, interpolation=3),
+    #     transforms.CenterCrop(224),
+    #     transforms.ToTensor(),
+    #     transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    # ])
 
-    traindir = os.path.join(args.data_path, "train")
-    valdir = os.path.join(args.data_path, "val")
+    # traindir = os.path.join(args.data_path, "train")
+    # valdir = os.path.join(args.data_path, "val")
 
-    dataset_train_knn = ImageFolderInstance(traindir, transform=transform_knn)
-    dataset_val_knn = ImageFolderInstance(valdir, transform=transform_knn)
+    # dataset_train_knn = ImageFolderInstance(traindir, transform=transform_knn)
+    # dataset_val_knn = ImageFolderInstance(valdir, transform=transform_knn)
 
-    if (args.subset is not None) and (args.subset >= 1):
-        dataset_train_knn = utils.subset_of_Imagenet_train_split(dataset_train_knn, args.subset)
+    # if (args.subset is not None) and (args.subset >= 1):
+    #     dataset_train_knn = utils.subset_of_Imagenet_train_split(dataset_train_knn, args.subset)
 
-    sampler_knn = torch.utils.data.DistributedSampler(dataset_train_knn, shuffle=False)
+    # sampler_knn = torch.utils.data.DistributedSampler(dataset_train_knn, shuffle=False)
     
-    data_loader_train_knn = torch.utils.data.DataLoader(
-        dataset_train_knn,
-        sampler=sampler_knn,
-        batch_size=args.batch_size_per_gpu,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
+    # data_loader_train_knn = torch.utils.data.DataLoader(
+    #     dataset_train_knn,
+    #     sampler=sampler_knn,
+    #     batch_size=args.batch_size_per_gpu,
+    #     num_workers=args.num_workers,
+    #     pin_memory=True,
+    #     drop_last=False,
+    # )
 
-    data_loader_val_knn = torch.utils.data.DataLoader(
-        dataset_val_knn,
-        batch_size=args.batch_size_per_gpu,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
+    # data_loader_val_knn = torch.utils.data.DataLoader(
+    #     dataset_val_knn,
+    #     batch_size=args.batch_size_per_gpu,
+    #     num_workers=args.num_workers,
+    #     pin_memory=True,
+    #     drop_last=False,
+    # )
 
     print(f"Data loaded for training: there are {len(dataset_train)} images.")
-    print(f"Data loaded for K-NN training: there are {len(dataset_train_knn)} images.")
-    print(f"Data loaded for K-NN validation: there are {len(dataset_val_knn)} images.")
+    # print(f"Data loaded for K-NN training: there are {len(dataset_train_knn)} images.")
+    # print(f"Data loaded for K-NN validation: there are {len(dataset_val_knn)} images.")
 
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
@@ -440,8 +440,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
     real_labels, pred_labels = [], []
-    for it, (images, labels, masks) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for it, (image1,image2, masks) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # update weight decay and learning rate according to their schedule
+        images=[image1,image2]
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
             param_group["lr"] = lr_schedule[it]
@@ -494,14 +495,14 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             print("Loss is {}, stopping training".format(loss.item()), force=True)
             sys.exit(1)
 
-        # log statistics
-        probs1 = teacher_output[0].chunk(args.global_crops_number)
-        probs2 = student_output[0].chunk(args.global_crops_number)
-        pred1 = utils.concat_all_gather(probs1[0].max(dim=1)[1]) 
-        pred2 = utils.concat_all_gather(probs2[1].max(dim=1)[1])
-        acc = (pred1 == pred2).sum() / pred1.size(0)
-        pred_labels.append(pred1)
-        real_labels.append(utils.concat_all_gather(labels.to(pred1.device)))
+        # # log statistics
+        # probs1 = teacher_output[0].chunk(args.global_crops_number)
+        # probs2 = student_output[0].chunk(args.global_crops_number)
+        # pred1 = utils.concat_all_gather(probs1[0].max(dim=1)[1]) 
+        # pred2 = utils.concat_all_gather(probs2[1].max(dim=1)[1])
+        # acc = (pred1 == pred2).sum() / pred1.size(0)
+        # pred_labels.append(pred1)
+        # real_labels.append(utils.concat_all_gather(labels.to(pred1.device)))
 
         # student update
         optimizer.zero_grad()
@@ -546,47 +547,21 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             metric_logger.update(**{key: value.item()})
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
-        metric_logger.update(acc=acc)
+        # metric_logger.update(acc=acc)
 
-    pred_labels = torch.cat(pred_labels).cpu().detach().numpy()
-    real_labels = torch.cat(real_labels).cpu().detach().numpy()
-    nmi, ari, fscore, adjacc = eval_pred(real_labels, pred_labels, calc_acc=False)
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    print("NMI: {}, ARI: {}, F: {}, ACC: {}".format(nmi, ari, fscore, adjacc))
-    print("Averaged stats:", metric_logger)
-    return_dict = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-    return_dict.update({"nmi": nmi, "ari": ari, "fscore": fscore, "adjacc": adjacc})
+    # pred_labels = torch.cat(pred_labels).cpu().detach().numpy()
+    # real_labels = torch.cat(real_labels).cpu().detach().numpy()
+    # nmi, ari, fscore, adjacc = eval_pred(real_labels, pred_labels, calc_acc=False)
+    # # gather the stats from all processes
+    # metric_logger.synchronize_between_processes()
+    # print("NMI: {}, ARI: {}, F: {}, ACC: {}".format(nmi, ari, fscore, adjacc))
+    # print("Averaged stats:", metric_logger)
+    # return_dict = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    # return_dict.update({"nmi": nmi, "ari": ari, "fscore": fscore, "adjacc": adjacc})
+    return_dict={"loss":loss.item()}
     return return_dict
 
 
-def knn_evaluation_pipeline(teacher, data_loader_train_knn, data_loader_val_knn, args):
-    teacher.eval()
-    # ============ extract features... ============
-    print("Extracting features for train set...")
-    train_features, train_labels = extract_features(teacher.backbone, data_loader_train_knn, args.n_last_blocks, args.avgpool_patchtokens, args.use_cuda)
-    print("Extracting features for val set...")
-    test_features, test_labels = extract_features(teacher.backbone, data_loader_val_knn, args.n_last_blocks, args.avgpool_patchtokens, args.use_cuda)
-
-    if utils.get_rank() == 0:
-        train_features = nn.functional.normalize(train_features, dim=1, p=2)
-        test_features = nn.functional.normalize(test_features, dim=1, p=2)
-
-    print("Features are ready!\nStart the k-NN classification.")
-    knn_results = {'k-NN':{}}
-    if utils.get_rank() == 0:
-        train_features = train_features.cuda()
-        test_features = test_features.cuda()
-        train_labels = train_labels.cuda()
-        test_labels = test_labels.cuda()
-
-        for k in args.nb_knn:
-            top1, top5 = knn_classifier(train_features, train_labels,
-                test_features, test_labels, k, args.teacher_temp, args.use_cuda)
-            print(f"{k}-NN classifier result: Top1: {top1}, Top5: {top5}")
-            knn_results['k-NN'].update({k:{'top1':top1, 'top5':top5}})
-    dist.barrier()
-    return knn_results
 
 class iBOTLoss(nn.Module):
     def __init__(self, out_dim, patch_out_dim, ngcrops, nlcrops, warmup_teacher_temp, 
