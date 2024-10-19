@@ -414,12 +414,12 @@ def train_attmask(args):
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      'epoch': epoch}
         
-        if epoch % args.eval_every == 0 or epoch == args.epochs - 1:
+        # if epoch % args.eval_every == 0 or epoch == args.epochs - 1:
 
-            knn_results = knn_evaluation_pipeline(
-                teacher, data_loader_train_knn,
-                data_loader_val_knn, args)
-            log_stats.update(knn_results)
+        #     knn_results = knn_evaluation_pipeline(
+        #         teacher, data_loader_train_knn,
+        #         data_loader_val_knn, args)
+        #     log_stats.update(knn_results)
         
         teacher.train()
 
